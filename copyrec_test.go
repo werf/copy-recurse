@@ -137,8 +137,12 @@ var _ = Describe("CopyRecurse", func() {
 		Entry("copy only matching empty directory",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{
-					MatchDir: func(path string) (bool, error) {
-						return filepath.Base(path) == "matched-subdir", nil
+					MatchDir: func(path string) (copyrec.DirAction, error) {
+						if filepath.Base(path) == "matched-subdir" {
+							return copyrec.DirMatch, nil
+						} else {
+							return copyrec.DirFallThrough, nil
+						}
 					},
 				},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {
@@ -174,8 +178,12 @@ var _ = Describe("CopyRecurse", func() {
 					MatchFile: func(path string) (bool, error) {
 						return filepath.Base(path) == "matched-file", nil
 					},
-					FallThroughDir: func(path string) (bool, error) {
-						return filepath.Base(filepath.Clean(path)) == "matched-subdir", nil
+					MatchDir: func(path string) (copyrec.DirAction, error) {
+						if filepath.Base(filepath.Clean(path)) == "matched-subdir" {
+							return copyrec.DirFallThrough, nil
+						} else {
+							return copyrec.DirSkip, nil
+						}
 					},
 				},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {
@@ -247,15 +255,11 @@ var _ = Describe("CopyRecurse", func() {
 		Entry("complex test, first debug smaller tests if they broke too",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{
-					MatchDir: func(path string) (bool, error) {
-						return filepath.Base(filepath.Clean(path)) == "sd2", nil
+					MatchDir: func(path string) (copyrec.DirAction, error) {
+						return copyrec.DirFallThrough, nil
 					},
-					// FIXME(ilya-lesikov): if matchfile is present, then never simply matchdir, because excluded files might be inside of it
 					MatchFile: func(path string) (bool, error) {
 						return filepath.Base(filepath.Clean(path)) != "notincluded", nil
-					},
-					FallThroughDir: func(path string) (bool, error) {
-						return true, nil
 					},
 					// User not allowed to set UID to other than his own on *nix.
 					UID: intToUint32Ptr(os.Getuid()),
@@ -333,11 +337,9 @@ var _ = Describe("CopyRecurse", func() {
 					Expect(stat.Gid).To(Equal(uint32(getFirstUserGroupSortedNumerically())))
 					Expect(getFileContent(filepath.Join(tmpDest, "sd2", "sd", "file5"))).To(Equal("content5"))
 
-					// FIXME(ilya-lesikov): if matchfile is present, then never simply matchdir, because excluded files might be inside of it
-					// Expect(filepath.Join(tmpDest, "sd2", "sd", "sd")).ToNot(BeAnExistingFile())
+					Expect(filepath.Join(tmpDest, "sd2", "sd", "sd")).ToNot(BeAnExistingFile())
 
-					// FIXME(ilya-lesikov): if matchfile is present, then never simply matchdir, because excluded files might be inside of it
-					// Expect(filepath.Join(tmpDest, "sd2", "sd", "sd", "notincluded")).ToNot(BeAnExistingFile())
+					Expect(filepath.Join(tmpDest, "sd2", "sd", "sd", "notincluded")).ToNot(BeAnExistingFile())
 
 					fi, stat = getFileInfoAndStat(filepath.Join(tmpDest, "sd", "sd", "file4"))
 					Expect(fi.Mode().IsRegular()).To(BeTrue())

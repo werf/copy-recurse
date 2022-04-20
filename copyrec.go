@@ -1,6 +1,5 @@
 package copyrec
 
-import "C"
 import (
 	"context"
 	"errors"

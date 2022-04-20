@@ -18,6 +18,8 @@ type (
 )
 
 type CopyRecurseTestConfig struct {
+	Source             string
+	Destination        string
 	CopyRecurseOptions copyrec.Options
 	CreateFilesFunc    CreateSourceFilesFunc
 	ExpectedFunc       ExpectedFunc
@@ -44,6 +46,14 @@ var _ = Describe("CopyRecurse", func() {
 
 	DescribeTable("should succeed and",
 		func(config CopyRecurseTestConfig) {
+			if config.Source == "" {
+				config.Source = tmpSrc
+			}
+
+			if config.Destination == "" {
+				config.Destination = tmpDest
+			}
+
 			config.CreateFilesFunc(config)
 
 			copyRec, err := copyrec.New(tmpSrc, tmpDest, config.CopyRecurseOptions)
@@ -54,6 +64,22 @@ var _ = Describe("CopyRecurse", func() {
 			config.ExpectedFunc(config)
 		},
 		Entry("copy file with correct mode",
+			CopyRecurseTestConfig{
+				Source:             filepath.Join(tmpSrc, "file"),
+				Destination:        filepath.Join(tmpDest, "file"),
+				CopyRecurseOptions: copyrec.Options{},
+				CreateFilesFunc: func(config CopyRecurseTestConfig) {
+					Expect(os.WriteFile(filepath.Join(tmpSrc, "file"), []byte("content"), os.FileMode(0o754))).To(Succeed())
+				},
+				ExpectedFunc: func(config CopyRecurseTestConfig) {
+					fi, _ := getFileInfoAndStat(filepath.Join(tmpDest, "file"))
+					Expect(fi.Mode().String()).To(Equal(os.FileMode(0o754).String()))
+
+					Expect(getFileContent(filepath.Join(tmpDest, "file"))).To(Equal("content"))
+				},
+			},
+		),
+		Entry("copy file nested in a dir with correct mode",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {
@@ -67,7 +93,7 @@ var _ = Describe("CopyRecurse", func() {
 				},
 			},
 		),
-		Entry("copy symlink unchanged",
+		Entry("copy symlink nested in a dir from dir unchanged",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {
@@ -79,7 +105,7 @@ var _ = Describe("CopyRecurse", func() {
 				},
 			},
 		),
-		Entry("copy empty directory with correct mode",
+		Entry("copy empty directory nested in a dir with correct mode",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {
@@ -91,7 +117,7 @@ var _ = Describe("CopyRecurse", func() {
 				},
 			},
 		),
-		Entry("copy nothing when nothing is in source",
+		Entry("copy nothing when nothing is in source dir",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{},
 				CreateFilesFunc:    func(config CopyRecurseTestConfig) {},
@@ -102,7 +128,7 @@ var _ = Describe("CopyRecurse", func() {
 				},
 			},
 		),
-		Entry("skip unsupported file",
+		Entry("skip unsupported file nested in a dir",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {

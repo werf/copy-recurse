@@ -303,7 +303,7 @@ func (c *CopyRecurse) createEmptyDirsChain(ctx context.Context, destPath string)
 	dirsToVisit := []string{c.dest}
 	relDestPathParts := strings.Split(relDestPath, string(filepath.Separator))
 	for i := 0; i < len(relDestPathParts); i++ {
-		dirsToVisit = append(dirsToVisit, filepath.Join(c.dest, filepath.Join(relDestPathParts[:len(relDestPathParts)-i]...)))
+		dirsToVisit = append([]string{filepath.Join(c.dest, filepath.Join(relDestPathParts[:i+1]...))}, dirsToVisit...)
 	}
 
 	for _, visitedDir := range c.visitedDestDirs {
@@ -316,7 +316,7 @@ func (c *CopyRecurse) createEmptyDirsChain(ctx context.Context, destPath string)
 				if i == 0 {
 					return nil
 				}
-				dirsToVisit = dirsToVisit[i+1:]
+				dirsToVisit = dirsToVisit[:i+1]
 				break
 			}
 		}
@@ -329,6 +329,8 @@ func (c *CopyRecurse) createEmptyDirsChain(ctx context.Context, destPath string)
 			return fmt.Errorf("error creating empty dir %q: %w", destPath, err)
 		}
 	}
+
+	c.visitedDestDirs = append(c.visitedDestDirs, dirsToVisit...)
 
 	return nil
 }

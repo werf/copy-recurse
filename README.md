@@ -17,8 +17,8 @@ Advanced:
 uid, gid := uint32(1000), uint32(1000)
 
 copyRec, err := copyrec.New(src, dest, copyrec.Options{
-    UID: uid,
-    GID: gid,
+    UID: &uid,
+    GID: &gid,
     MatchDir: func(path string) (copyrec.DirAction, error) {
         switch filepath.Base(path) {
         case "match-this-dir-fully":

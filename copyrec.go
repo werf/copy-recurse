@@ -1,5 +1,6 @@
 package copyrec
 
+import "C"
 import (
 	"context"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -15,18 +17,33 @@ import (
 )
 
 type (
-	MatchFileFunc      func(path string) (bool, error)
-	MatchDirFunc       func(path string) (bool, error)
-	FallThroughDirFunc func(path string) (bool, error)
+	MatchDirFunc  func(path string) (DirAction, error)
+	MatchFileFunc func(path string) (bool, error)
+)
+
+type DirAction int
+
+const (
+	DirMatch DirAction = iota
+	DirFallThrough
+	DirSkip
 )
 
 type Options struct {
+	// Set UID for copied files/directories.
 	UID *uint32
+
+	// Set GID for copied files/directories.
 	GID *uint32
 
-	MatchDir       MatchDirFunc
-	MatchFile      MatchFileFunc
-	FallThroughDir FallThroughDirFunc
+	// Function decides should we match a directory while walking, fall through it to continue searching for matches or skip it.
+	// If not defined, but matchFile is defined, then it always returns DirFallThrough.
+	// If not defined and matchFile is undefined, then it always returns DirMatch.
+	MatchDir MatchDirFunc
+
+	// Function decides whether should we match a file while walking.
+	// If not defined, then it always returns true.
+	MatchFile MatchFileFunc
 
 	AbortIfDestParentDirNotExists bool
 }
@@ -37,9 +54,8 @@ type CopyRecurse struct {
 	uid  *uint32
 	gid  *uint32
 
-	matchDir       MatchDirFunc
-	matchFile      MatchFileFunc
-	fallThroughDir FallThroughDirFunc
+	matchDir  MatchDirFunc
+	matchFile MatchFileFunc
 
 	abortIfDestParentDirNotExists bool
 
@@ -51,19 +67,32 @@ func New(src, dest string, opts Options) (*CopyRecurse, error) {
 	copyRec := &CopyRecurse{
 		src:                           filepath.Clean(src),
 		dest:                          filepath.Clean(dest),
-		matchFile:                     opts.MatchFile,
-		fallThroughDir:                opts.FallThroughDir,
 		uid:                           opts.UID,
 		gid:                           opts.GID,
 		abortIfDestParentDirNotExists: opts.AbortIfDestParentDirNotExists,
 	}
 
-	if opts.MatchDir == nil && opts.MatchFile == nil {
-		copyRec.matchDir = func(path string) (bool, error) {
+	switch {
+	case opts.MatchDir == nil && opts.MatchFile == nil:
+		copyRec.matchDir = func(path string) (DirAction, error) {
+			return DirMatch, nil
+		}
+		copyRec.matchFile = func(path string) (bool, error) {
 			return true, nil
 		}
-	} else {
+	case opts.MatchDir == nil:
+		copyRec.matchDir = func(path string) (DirAction, error) {
+			return DirFallThrough, nil
+		}
+		copyRec.matchFile = opts.MatchFile
+	case opts.MatchFile == nil:
 		copyRec.matchDir = opts.MatchDir
+		copyRec.matchFile = func(path string) (bool, error) {
+			return true, nil
+		}
+	default:
+		copyRec.matchDir = opts.MatchDir
+		copyRec.matchFile = opts.MatchFile
 	}
 
 	return copyRec, nil
@@ -110,7 +139,7 @@ func (c *CopyRecurse) prepareDestParentDir(ctx context.Context) error {
 	destParentDir := getParentDir(c.dest)
 
 	_, err := os.Lstat(destParentDir)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if c.abortIfDestParentDirNotExists {
 			return fmt.Errorf("directory %q does not exist", destParentDir)
 		}
@@ -128,12 +157,6 @@ func (c *CopyRecurse) prepareDestParentDir(ctx context.Context) error {
 func (c *CopyRecurse) processFile(ctx context.Context, src, dest string) error {
 	logboek.Context(ctx).Debug().LogF("Processing file %q.\n", src)
 
-	if c.matchFile == nil {
-		c.matchFile = func(path string) (bool, error) {
-			return true, nil
-		}
-	}
-
 	if match, err := c.matchFile(src); err != nil {
 		return fmt.Errorf("error matching file %q: %w", src, err)
 	} else if match {
@@ -150,31 +173,31 @@ func (c *CopyRecurse) processFile(ctx context.Context, src, dest string) error {
 func (c *CopyRecurse) processDir(ctx context.Context, src, dest string) error {
 	logboek.Context(ctx).Debug().LogF("Processing directory %q.\n", src)
 
-	if c.matchDir != nil {
-		if match, err := c.matchDir(src); err != nil {
-			return fmt.Errorf("error matching directory %q: %w", src, err)
-		} else if match {
-			logboek.Context(ctx).Debug().LogF("Dir %q fully matched.\n", src)
-			if err := c.copyRecurse(ctx, src, dest); err != nil {
-				return fmt.Errorf("error copying directory: %w", err)
-			}
-			return nil
+	if filepath.Clean(src) == c.src {
+		logboek.Context(ctx).Debug().LogF("Will look for matches in directory %q.\n", src)
+		return nil
+	}
+
+	action, err := c.matchDir(src)
+	if err != nil {
+		return fmt.Errorf("error matching directory %q: %w", src, err)
+	}
+
+	switch action {
+	case DirMatch:
+		logboek.Context(ctx).Debug().LogF("Dir %q fully matched.\n", src)
+		if err := c.copyRecurse(ctx, src, dest); err != nil {
+			return fmt.Errorf("error copying directory: %w", err)
 		}
-	}
-
-	if c.fallThroughDir == nil || filepath.Clean(src) == c.src {
+		return nil
+	case DirFallThrough:
 		logboek.Context(ctx).Debug().LogF("Will look for matches in directory %q.\n", src)
 		return nil
-	}
-
-	if fallThrough, err := c.fallThroughDir(src); err != nil {
-		return fmt.Errorf("error determining whether to fall through directory %q: %w", src, err)
-	} else if fallThrough {
-		logboek.Context(ctx).Debug().LogF("Will look for matches in directory %q.\n", src)
-		return nil
-	} else {
+	case DirSkip:
 		logboek.Context(ctx).Debug().LogF("Skipping directory %q.\n", src)
 		return fs.SkipDir
+	default:
+		panic(fmt.Sprintf("unexpected action (int %d)", action))
 	}
 }
 
@@ -279,7 +302,7 @@ func (c *CopyRecurse) createEmptyDirsChain(ctx context.Context, destPath string)
 	}
 
 	dirsToVisit := []string{c.dest}
-	relDestPathParts := strings.Split(relDestPath, "/")
+	relDestPathParts := strings.Split(relDestPath, string(filepath.Separator))
 	for i := 0; i < len(relDestPathParts); i++ {
 		dirsToVisit = append(dirsToVisit, filepath.Join(c.dest, filepath.Join(relDestPathParts[:len(relDestPathParts)-i]...)))
 	}
@@ -299,6 +322,8 @@ func (c *CopyRecurse) createEmptyDirsChain(ctx context.Context, destPath string)
 			}
 		}
 	}
+
+	sort.Slice(dirsToVisit, func(i, j int) bool { return i > j })
 
 	for _, dir := range dirsToVisit {
 		if err := c.createEmptyDirInChain(ctx, dir); err != nil {

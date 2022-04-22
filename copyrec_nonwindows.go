@@ -1,3 +1,6 @@
+//go:build !windows
+// +build !windows
+
 package copyrec
 
 import (
@@ -14,53 +17,6 @@ import (
 
 	"github.com/werf/logboek"
 )
-
-type (
-	MatchDirFunc  func(path string) (DirAction, error)
-	MatchFileFunc func(path string) (bool, error)
-)
-
-type DirAction int
-
-const (
-	DirMatch DirAction = iota
-	DirFallThrough
-	DirSkip
-)
-
-type Options struct {
-	// Set UID for copied files/directories.
-	UID *uint32
-
-	// Set GID for copied files/directories.
-	GID *uint32
-
-	// Function decides should we match a directory while walking, fall through it to continue searching for matches or skip it.
-	// If not defined, but matchFile is defined, then it always returns DirFallThrough.
-	// If not defined and matchFile is undefined, then it always returns DirMatch.
-	MatchDir MatchDirFunc
-
-	// Function decides whether should we match a file while walking.
-	// If not defined, then it always returns true.
-	MatchFile MatchFileFunc
-
-	AbortIfDestParentDirNotExists bool
-}
-
-type CopyRecurse struct {
-	src  string
-	dest string
-	uid  *uint32
-	gid  *uint32
-
-	matchDir  MatchDirFunc
-	matchFile MatchFileFunc
-
-	abortIfDestParentDirNotExists bool
-
-	// TODO: how memory/CPU-effective is working with this?
-	visitedDestDirs []string
-}
 
 func New(src, dest string, opts Options) (*CopyRecurse, error) {
 	copyRec := &CopyRecurse{

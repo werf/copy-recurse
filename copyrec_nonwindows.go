@@ -20,11 +20,25 @@ import (
 
 func New(src, dest string, opts Options) (*CopyRecurse, error) {
 	copyRec := &CopyRecurse{
-		src:                           filepath.Clean(src),
-		dest:                          filepath.Clean(dest),
 		uid:                           opts.UID,
 		gid:                           opts.GID,
 		abortIfDestParentDirNotExists: opts.AbortIfDestParentDirNotExists,
+	}
+
+	var err error
+	copyRec.src, err = filepath.Abs(src)
+	if err != nil {
+		return nil, fmt.Errorf("error getting absolute path for src %q: %w", src, err)
+	}
+
+	copyRec.dest, err = filepath.Abs(dest)
+	if err != nil {
+		return nil, fmt.Errorf("error getting absolute path for dest %q: %w", dest, err)
+	}
+
+	copyRec.dest, err = dereferenceDestIfDir(copyRec.dest)
+	if err != nil {
+		return nil, fmt.Errorf("error dereferencing dest if directory: %w", err)
 	}
 
 	switch {
@@ -92,18 +106,51 @@ func (c *CopyRecurse) prepareDestParentDir(ctx context.Context) error {
 	logboek.Context(ctx).Debug().LogF("Preparing parent dir for destination %q.\n", c.dest)
 
 	destParentDir := getParentDir(c.dest)
-
-	_, err := os.Lstat(destParentDir)
-	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+	if fileInfo, err := os.Lstat(destParentDir); errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if c.abortIfDestParentDirNotExists {
 			return fmt.Errorf("directory %q does not exist", destParentDir)
 		}
 
+		logboek.Context(ctx).Debug().LogF("Creating destination parent dir (and its parents) at %q.\n", destParentDir)
 		if err := os.MkdirAll(destParentDir, os.ModePerm); err != nil {
 			return fmt.Errorf("error creating directories up to parent destination directory %q: %w", destParentDir, err)
 		}
 	} else if err != nil {
 		return fmt.Errorf("error getting file info about parent destination directory %q: %w", destParentDir, err)
+	} else if !fileInfo.IsDir() && fileInfo.Mode()&os.ModeSymlink == 0 {
+		if err := c.recreateParentDir(ctx, destParentDir); err != nil {
+			return fmt.Errorf("error recreating parent dir: %w", err)
+		}
+	} else if fileInfo.Mode()&os.ModeSymlink != 0 {
+		if dereferencedDestParentDir, err := os.Stat(destParentDir); errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			if err := c.recreateParentDir(ctx, destParentDir); err != nil {
+				return fmt.Errorf("error recreating parent dir: %w", err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("error getting dereferenced file info for destination parent dir %q: %w", destParentDir, err)
+		} else if !dereferencedDestParentDir.IsDir() {
+			if err := c.recreateParentDir(ctx, destParentDir); err != nil {
+				return fmt.Errorf("error recreating parent dir: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *CopyRecurse) recreateParentDir(ctx context.Context, destParentDir string) error {
+	if c.abortIfDestParentDirNotExists {
+		return fmt.Errorf("something is in place of a destination parent dir %q", destParentDir)
+	}
+
+	logboek.Context(ctx).Debug().LogF("Removing file in place of a destination parent dir %q.\n", destParentDir)
+	if err := os.RemoveAll(destParentDir); err != nil {
+		return fmt.Errorf("error removing file in place of a destination parent dir %q: %w", destParentDir, err)
+	}
+
+	logboek.Context(ctx).Debug().LogF("Creating destination parent dir (and its parents) at %q.\n", destParentDir)
+	if err := os.MkdirAll(destParentDir, os.ModePerm); err != nil {
+		return fmt.Errorf("error creating directories up to parent destination directory %q: %w", destParentDir, err)
 	}
 
 	return nil
@@ -186,10 +233,6 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 				if err := c.createEmptyDirsChain(ctx, absEntryDestPath); err != nil {
 					return fmt.Errorf("error creating empty dirs chain: %w", err)
 				}
-
-				if err := c.processDirOwnership(ctx, absEntryDestPath, srcEntryFileInfo.Sys().(*syscall.Stat_t)); err != nil {
-					return fmt.Errorf("error processing directory ownership: %w", err)
-				}
 			case srcEntryFileInfo.Mode().IsRegular():
 				if err := c.createEmptyDirsChain(ctx, getParentDir(absEntryDestPath)); err != nil {
 					return fmt.Errorf("error creating empty dirs chain: %w", err)
@@ -220,16 +263,20 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 			srcStat = srcFileInfo.Sys().(*syscall.Stat_t)
 		}
 
-		if err := c.createEmptyDirsChain(ctx, getParentDir(dest)); err != nil {
-			return fmt.Errorf("error creating empty dirs chain: %w", err)
+		if dest != c.dest {
+			if err := c.createEmptyDirsChain(ctx, getParentDir(dest)); err != nil {
+				return fmt.Errorf("error creating empty dirs chain: %w", err)
+			}
 		}
 
 		if err := c.copyFile(ctx, src, srcFileInfo, srcStat, dest); err != nil {
 			return fmt.Errorf("error copying file: %w", err)
 		}
 	case srcFileInfo.Mode()&os.ModeSymlink != 0:
-		if err := c.createEmptyDirsChain(ctx, getParentDir(dest)); err != nil {
-			return fmt.Errorf("error creating empty dirs chain: %w", err)
+		if dest != c.dest {
+			if err := c.createEmptyDirsChain(ctx, getParentDir(dest)); err != nil {
+				return fmt.Errorf("error creating empty dirs chain: %w", err)
+			}
 		}
 
 		if err := c.copySymlink(ctx, src, dest); err != nil {
@@ -251,15 +298,18 @@ func (c *CopyRecurse) createEmptyDirsChain(ctx context.Context, destPath string)
 		}
 	}
 
-	relDestPath, err := filepath.Rel(c.dest, destPath)
-	if err != nil {
-		return fmt.Errorf("error calculating relative path for base %q and target %q: %w", c.dest, destPath, err)
-	}
-
 	dirsToVisit := []string{c.dest}
-	relDestPathParts := strings.Split(relDestPath, string(filepath.Separator))
-	for i := 0; i < len(relDestPathParts); i++ {
-		dirsToVisit = append([]string{filepath.Join(c.dest, filepath.Join(relDestPathParts[:i+1]...))}, dirsToVisit...)
+
+	if strings.HasPrefix(destPath, c.dest) && strings.TrimPrefix(filepath.Clean(destPath), c.dest) != "" {
+		relDestPath, err := filepath.Rel(c.dest, destPath)
+		if err != nil {
+			return fmt.Errorf("error calculating relative path for base %q and target %q: %w", c.dest, destPath, err)
+		}
+
+		relDestPathParts := strings.Split(relDestPath, string(filepath.Separator))
+		for i := 0; i < len(relDestPathParts); i++ {
+			dirsToVisit = append([]string{filepath.Join(c.dest, filepath.Join(relDestPathParts[:i+1]...))}, dirsToVisit...)
+		}
 	}
 
 	for _, visitedDir := range c.visitedDestDirs {
@@ -339,6 +389,7 @@ func (c *CopyRecurse) createEmptyDirInChain(ctx context.Context, destPath string
 	if err := c.processDirOwnership(ctx, destPath, srcStat); err != nil {
 		return fmt.Errorf("error processing dir ownership: %w", err)
 	}
+
 	return nil
 }
 
@@ -481,4 +532,30 @@ func uint32PtrPString(num *uint32) string {
 	}
 
 	return fmt.Sprintf("%d", *num)
+}
+
+func dereferenceDestIfDir(dest string) (string, error) {
+	newDest := dest
+
+	destFileInfo, err := os.Lstat(dest)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return newDest, nil
+	} else if err != nil {
+		return "", fmt.Errorf("error getting file info for file %q: %w", dest, err)
+	}
+
+	if destFileInfo.Mode()&os.ModeSymlink != 0 {
+		if dereferencedFileInfo, err := os.Stat(dest); errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return newDest, nil
+		} else if err != nil {
+			return "", fmt.Errorf("error getting dereferencing file info for %q: %w", dest, err)
+		} else if dereferencedFileInfo.IsDir() {
+			newDest, err = os.Readlink(dest)
+			if err != nil {
+				return "", fmt.Errorf("error resolving symlink at %q: %w", dest, err)
+			}
+		}
+	}
+
+	return newDest, nil
 }

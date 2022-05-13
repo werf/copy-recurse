@@ -9,7 +9,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/werf/copy-recurse"
+	copyrec "github.com/werf/copy-recurse"
 )
 
 type (
@@ -18,8 +18,8 @@ type (
 )
 
 type CopyRecurseTestConfig struct {
-	Source             string
-	Destination        string
+	SrcRel             string
+	DestRel            string
 	CopyRecurseOptions copyrec.Options
 	CreateFilesFunc    CreateSourceFilesFunc
 	ExpectedFunc       ExpectedFunc
@@ -46,17 +46,9 @@ var _ = Describe("CopyRecurse", func() {
 
 	DescribeTable("should succeed and",
 		func(config CopyRecurseTestConfig) {
-			if config.Source == "" {
-				config.Source = tmpSrc
-			}
-
-			if config.Destination == "" {
-				config.Destination = tmpDest
-			}
-
 			config.CreateFilesFunc(config)
 
-			copyRec, err := copyrec.New(tmpSrc, tmpDest, config.CopyRecurseOptions)
+			copyRec, err := copyrec.New(filepath.Join(tmpSrc, config.SrcRel), filepath.Join(tmpDest, config.DestRel), config.CopyRecurseOptions)
 			Expect(err).ToNot(HaveOccurred())
 
 			Expect(copyRec.Run(ctx)).To(Succeed())
@@ -65,8 +57,8 @@ var _ = Describe("CopyRecurse", func() {
 		},
 		Entry("copy file with correct mode",
 			CopyRecurseTestConfig{
-				Source:             filepath.Join(tmpSrc, "file"),
-				Destination:        filepath.Join(tmpDest, "file"),
+				SrcRel:             "file",
+				DestRel:            "file",
 				CopyRecurseOptions: copyrec.Options{},
 				CreateFilesFunc: func(config CopyRecurseTestConfig) {
 					Expect(os.WriteFile(filepath.Join(tmpSrc, "file"), []byte("content"), os.FileMode(0o754))).To(Succeed())
@@ -90,6 +82,47 @@ var _ = Describe("CopyRecurse", func() {
 					Expect(fi.Mode().String()).To(Equal(os.FileMode(0o754).String()))
 
 					Expect(getFileContent(filepath.Join(tmpDest, "file"))).To(Equal("content"))
+				},
+			},
+		),
+		Entry("copy file nested in a dir to a symlinked destination dir",
+			CopyRecurseTestConfig{
+				SrcRel:             "file1",
+				DestRel:            filepath.Join("dirsymlink", "file1"),
+				CopyRecurseOptions: copyrec.Options{},
+				CreateFilesFunc: func(config CopyRecurseTestConfig) {
+					touchFile(filepath.Join(tmpSrc, "file1"))
+
+					Expect(os.Mkdir(filepath.Join(tmpDest, "dir"), os.ModePerm)).To(Succeed())
+					Expect(os.Symlink(filepath.Join(tmpDest, "dir"), filepath.Join(tmpDest, "dirsymlink"))).To(Succeed())
+					touchFile(filepath.Join(tmpDest, "dirsymlink", "file2"))
+				},
+				ExpectedFunc: func(config CopyRecurseTestConfig) {
+					fi, _ := getFileInfoAndStat(filepath.Join(tmpDest, "dirsymlink"))
+					Expect(fi.Mode().Type() & os.ModeSymlink).ToNot(Equal(0))
+
+					Expect(filepath.Join(tmpDest, "dirsymlink", "file1")).To(BeAnExistingFile())
+					Expect(filepath.Join(tmpDest, "dirsymlink", "file2")).To(BeAnExistingFile())
+				},
+			},
+		),
+		Entry("merge source dir contents with symlinked destination dir contents",
+			CopyRecurseTestConfig{
+				DestRel:            "dirsymlink",
+				CopyRecurseOptions: copyrec.Options{},
+				CreateFilesFunc: func(config CopyRecurseTestConfig) {
+					touchFile(filepath.Join(tmpSrc, "file1"))
+
+					Expect(os.Mkdir(filepath.Join(tmpDest, "dir"), os.ModePerm)).To(Succeed())
+					Expect(os.Symlink(filepath.Join(tmpDest, "dir"), filepath.Join(tmpDest, "dirsymlink"))).To(Succeed())
+					touchFile(filepath.Join(tmpDest, "dirsymlink", "file2"))
+				},
+				ExpectedFunc: func(config CopyRecurseTestConfig) {
+					fi, _ := getFileInfoAndStat(filepath.Join(tmpDest, "dirsymlink"))
+					Expect(fi.Mode().Type() & os.ModeSymlink).ToNot(Equal(0))
+
+					Expect(filepath.Join(tmpDest, "dirsymlink", "file1")).To(BeAnExistingFile())
+					Expect(filepath.Join(tmpDest, "dirsymlink", "file2")).To(BeAnExistingFile())
 				},
 			},
 		),

@@ -3,7 +3,7 @@
 all: fmt lint test
 
 fmt:
-	gci -w -local github.com/werf/ .
+	gci -w --local github.com/werf/ .
 	gofumpt -w .
 
 lint:

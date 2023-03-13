@@ -10,4 +10,4 @@ lint:
 	golangci-lint run ./...
 
 test:
-	ginkgo2 run -r -p $(ARGS) .
+	ginkgo run -r -p $(ARGS) .

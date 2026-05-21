@@ -550,7 +550,7 @@ func dereferenceDestIfDir(dest string) (string, error) {
 		} else if err != nil {
 			return "", fmt.Errorf("error getting dereferencing file info for %q: %w", dest, err)
 		} else if dereferencedFileInfo.IsDir() {
-			newDest, err = os.Readlink(dest)
+			newDest, err = filepath.EvalSymlinks(dest)
 			if err != nil {
 				return "", fmt.Errorf("error resolving symlink at %q: %w", dest, err)
 			}

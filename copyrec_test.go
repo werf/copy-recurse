@@ -126,6 +126,25 @@ var _ = Describe("CopyRecurse", func() {
 				},
 			},
 		),
+		Entry("resolve relative symlink on destination dir",
+			CopyRecurseTestConfig{
+				DestRel:            "bin",
+				CopyRecurseOptions: copyrec.Options{},
+				CreateFilesFunc: func(config CopyRecurseTestConfig) {
+					touchFile(filepath.Join(tmpSrc, "myapp"))
+
+					Expect(os.MkdirAll(filepath.Join(tmpDest, "usr", "bin"), os.ModePerm)).To(Succeed())
+					Expect(os.Symlink("usr/bin", filepath.Join(tmpDest, "bin"))).To(Succeed())
+				},
+				ExpectedFunc: func(config CopyRecurseTestConfig) {
+					fi, _ := getFileInfoAndStat(filepath.Join(tmpDest, "bin"))
+					Expect(fi.Mode().Type() & os.ModeSymlink).ToNot(Equal(0))
+
+					Expect(filepath.Join(tmpDest, "usr", "bin", "myapp")).To(BeAnExistingFile())
+					Expect(filepath.Join(tmpDest, "bin", "myapp")).To(BeAnExistingFile())
+				},
+			},
+		),
 		Entry("copy symlink nested in a dir from dir unchanged",
 			CopyRecurseTestConfig{
 				CopyRecurseOptions: copyrec.Options{},

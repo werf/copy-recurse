@@ -23,7 +23,22 @@ func New(src, dest string, opts Options) (*CopyRecurse, error) {
 		uid:                           opts.UID,
 		gid:                           opts.GID,
 		abortIfDestParentDirNotExists: opts.AbortIfDestParentDirNotExists,
+		parallelism:                   opts.Parallelism,
 	}
+
+	if copyRec.parallelism < 1 {
+		copyRec.parallelism = 1
+	}
+
+	// Cached once so per-file copy can decide whether an explicit fchmod/fchown
+	// is required after O_CREAT. Umask read is racy against other goroutines
+	// touching umask, but copy-recurse is the sole consumer in werf and callers
+	// do not race with New().
+	u := syscall.Umask(0)
+	syscall.Umask(u)
+	copyRec.processUmask = os.FileMode(u)
+	copyRec.processUID = os.Geteuid()
+	copyRec.processGID = os.Getegid()
 
 	var err error
 	copyRec.src, err = filepath.Abs(src)
@@ -72,9 +87,15 @@ func (c *CopyRecurse) Run(ctx context.Context) error {
 		return fmt.Errorf("error creating destination directory: %w", err)
 	}
 
-	if err := walkPath(ctx, c.src, func(relEntryPath string, dirEntry *fs.DirEntry, err error) error {
+	c.startWorkers(ctx)
+
+	walkErr := walkPath(ctx, c.src, func(relEntryPath string, dirEntry *fs.DirEntry, err error) error {
 		if err != nil {
 			return fmt.Errorf("error walking path: %w", err)
+		}
+
+		if e := c.workError(); e != nil {
+			return e
 		}
 
 		entrySrc := filepath.Join(c.src, relEntryPath)
@@ -95,11 +116,121 @@ func (c *CopyRecurse) Run(ctx context.Context) error {
 		}
 
 		return nil
-	}); err != nil {
-		return fmt.Errorf("error walking path: %w", err)
-	}
+	})
 
-	return nil
+	workErr := c.stopWorkers()
+
+	if walkErr != nil {
+		return fmt.Errorf("error walking path: %w", walkErr)
+	}
+	return workErr
+}
+
+func (c *CopyRecurse) startWorkers(ctx context.Context) {
+	if c.parallelism <= 1 {
+		return
+	}
+	c.workCtx, c.workCancel = context.WithCancel(ctx)
+	c.workCh = make(chan copyJob, c.parallelism*4)
+	for i := 0; i < c.parallelism; i++ {
+		c.workWG.Add(1)
+		go c.workerLoop()
+	}
+}
+
+func (c *CopyRecurse) stopWorkers() error {
+	if c.workCh == nil {
+		return nil
+	}
+	close(c.workCh)
+	c.workWG.Wait()
+	c.workCancel()
+	c.workCh = nil
+	return c.firstErr
+}
+
+func (c *CopyRecurse) workerLoop() {
+	defer c.workWG.Done()
+	for job := range c.workCh {
+		if c.workError() != nil {
+			continue
+		}
+		if err := c.runJob(c.workCtx, job); err != nil {
+			c.recordErr(err)
+		}
+	}
+}
+
+func (c *CopyRecurse) runJob(ctx context.Context, job copyJob) error {
+	switch job.kind {
+	case copyJobFile:
+		return c.copyFile(ctx, job.src, job.srcFileInfo, statOf(job.srcFileInfo), job.dest)
+	case copyJobSymlink:
+		return c.copySymlink(ctx, job.src, job.dest)
+	default:
+		return fmt.Errorf("unexpected copy job kind %d", job.kind)
+	}
+}
+
+func (c *CopyRecurse) recordErr(err error) {
+	c.errMu.Lock()
+	if c.firstErr == nil {
+		c.firstErr = err
+		if c.workCancel != nil {
+			c.workCancel()
+		}
+	}
+	c.errMu.Unlock()
+}
+
+func (c *CopyRecurse) workError() error {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+	return c.firstErr
+}
+
+func (c *CopyRecurse) enqueueOrRunFile(ctx context.Context, src string, srcFileInfo os.FileInfo, srcStat *syscall.Stat_t, dest string) error {
+	if c.workCh == nil {
+		return c.copyFile(ctx, src, srcFileInfo, srcStat, dest)
+	}
+	if e := c.workError(); e != nil {
+		return e
+	}
+	select {
+	case <-c.workCtx.Done():
+		if e := c.workError(); e != nil {
+			return e
+		}
+		return c.workCtx.Err()
+	case c.workCh <- copyJob{kind: copyJobFile, src: src, dest: dest, srcFileInfo: srcFileInfo}:
+		return nil
+	}
+}
+
+func (c *CopyRecurse) enqueueOrRunSymlink(ctx context.Context, src, dest string) error {
+	if c.workCh == nil {
+		return c.copySymlink(ctx, src, dest)
+	}
+	if e := c.workError(); e != nil {
+		return e
+	}
+	select {
+	case <-c.workCtx.Done():
+		if e := c.workError(); e != nil {
+			return e
+		}
+		return c.workCtx.Err()
+	case c.workCh <- copyJob{kind: copyJobSymlink, src: src, dest: dest}:
+		return nil
+	}
+}
+
+func statOf(fi os.FileInfo) *syscall.Stat_t {
+	if fi == nil {
+		return nil
+	}
+	st, _ := fi.Sys().(*syscall.Stat_t)
+	return st
 }
 
 func (c *CopyRecurse) prepareDestParentDir(ctx context.Context) error {
@@ -218,6 +349,10 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 				return fmt.Errorf("error walking path: %w", e)
 			}
 
+			if werr := c.workError(); werr != nil {
+				return werr
+			}
+
 			absEntrySrcPath := filepath.Join(src, entryRelPath)
 			absEntryDestPath := filepath.Join(dest, entryRelPath)
 
@@ -238,7 +373,7 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 					return fmt.Errorf("error creating empty dirs chain: %w", err)
 				}
 
-				if err := c.copyFile(ctx, absEntrySrcPath, srcEntryFileInfo, srcEntryFileInfo.Sys().(*syscall.Stat_t), absEntryDestPath); err != nil {
+				if err := c.enqueueOrRunFile(ctx, absEntrySrcPath, srcEntryFileInfo, statOf(srcEntryFileInfo), absEntryDestPath); err != nil {
 					return fmt.Errorf("error copying file: %w", err)
 				}
 			case srcEntryFileInfo.Mode()&os.ModeSymlink != 0:
@@ -246,7 +381,7 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 					return fmt.Errorf("error creating empty dirs chain: %w", err)
 				}
 
-				if err := c.copySymlink(ctx, absEntrySrcPath, absEntryDestPath); err != nil {
+				if err := c.enqueueOrRunSymlink(ctx, absEntrySrcPath, absEntryDestPath); err != nil {
 					return fmt.Errorf("error copying symlink: %w", err)
 				}
 			default:
@@ -269,7 +404,7 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 			}
 		}
 
-		if err := c.copyFile(ctx, src, srcFileInfo, srcStat, dest); err != nil {
+		if err := c.enqueueOrRunFile(ctx, src, srcFileInfo, srcStat, dest); err != nil {
 			return fmt.Errorf("error copying file: %w", err)
 		}
 	case srcFileInfo.Mode()&os.ModeSymlink != 0:
@@ -279,7 +414,7 @@ func (c *CopyRecurse) copyRecurse(ctx context.Context, src, dest string) error {
 			}
 		}
 
-		if err := c.copySymlink(ctx, src, dest); err != nil {
+		if err := c.enqueueOrRunSymlink(ctx, src, dest); err != nil {
 			return fmt.Errorf("error copying symlink: %w", err)
 		}
 	default:
@@ -361,11 +496,22 @@ func (c *CopyRecurse) createEmptyDirInChain(ctx context.Context, destPath string
 		srcStat = srcFileInfo.Sys().(*syscall.Stat_t)
 	}
 
+	perm := srcFileInfo.Mode().Perm()
+
+	var existingStat *syscall.Stat_t
+	freshlyCreated := false
+
 	destFileInfo, err := os.Lstat(destPath)
 	if errors.Is(err, os.ErrNotExist) {
-		logboek.Context(ctx).Debug().LogF("Creating dir %q with perms %s.\n", destPath, srcFileInfo.Mode().Perm())
-		if err := os.Mkdir(destPath, srcFileInfo.Mode().Perm()); err != nil {
+		logboek.Context(ctx).Debug().LogF("Creating dir %q with perms %s.\n", destPath, perm)
+		if err := os.Mkdir(destPath, perm); err != nil {
 			return fmt.Errorf("error creating directory %q: %w", destPath, err)
+		}
+		freshlyCreated = true
+		if perm&c.processUmask != 0 {
+			if err := os.Chmod(destPath, perm); err != nil {
+				return fmt.Errorf("error changing permissions for %q to %s: %w", destPath, perm, err)
+			}
 		}
 	} else if err != nil {
 		return fmt.Errorf("can't get file info for %q: %w", destPath, err)
@@ -375,18 +521,27 @@ func (c *CopyRecurse) createEmptyDirInChain(ctx context.Context, destPath string
 			return fmt.Errorf("error removing path %q: %w", destPath, err)
 		}
 
-		logboek.Context(ctx).Debug().LogF("Creating dir %q with perms %s.\n", destPath, srcFileInfo.Mode().Perm())
-		if err := os.Mkdir(destPath, srcFileInfo.Mode().Perm()); err != nil {
+		logboek.Context(ctx).Debug().LogF("Creating dir %q with perms %s.\n", destPath, perm)
+		if err := os.Mkdir(destPath, perm); err != nil {
 			return fmt.Errorf("error creating directory %q: %w", destPath, err)
 		}
-	} else if srcFileInfo.Mode().Perm() != destFileInfo.Mode().Perm() {
-		logboek.Context(ctx).Debug().LogF("Setting perms of already present dir %q to %s.\n", destPath, srcFileInfo.Mode().Perm())
-		if err := os.Chmod(destPath, srcFileInfo.Mode().Perm()); err != nil {
-			return fmt.Errorf("error changing permissions for %q to %s: %w", destPath, srcFileInfo.Mode().Perm(), err)
+		freshlyCreated = true
+		if perm&c.processUmask != 0 {
+			if err := os.Chmod(destPath, perm); err != nil {
+				return fmt.Errorf("error changing permissions for %q to %s: %w", destPath, perm, err)
+			}
+		}
+	} else {
+		existingStat, _ = destFileInfo.Sys().(*syscall.Stat_t)
+		if destFileInfo.Mode().Perm() != perm {
+			logboek.Context(ctx).Debug().LogF("Setting perms of already present dir %q to %s.\n", destPath, perm)
+			if err := os.Chmod(destPath, perm); err != nil {
+				return fmt.Errorf("error changing permissions for %q to %s: %w", destPath, perm, err)
+			}
 		}
 	}
 
-	if err := c.processDirOwnership(ctx, destPath, srcStat); err != nil {
+	if err := c.processDirOwnership(ctx, destPath, srcStat, existingStat, freshlyCreated); err != nil {
 		return fmt.Errorf("error processing dir ownership: %w", err)
 	}
 
@@ -403,27 +558,46 @@ func (c *CopyRecurse) copyFile(ctx context.Context, src string, srcFileInfo os.F
 	}
 	defer srcFile.Close()
 
-	_, err = os.Lstat(dest)
-	if err == nil {
-		logboek.Context(ctx).Debug().LogF("Removing path %q.\n", dest)
-		if err := os.RemoveAll(dest); err != nil {
-			return fmt.Errorf("error removing path %q: %w", dest, err)
+	var existingPerm os.FileMode
+	var existingStat *syscall.Stat_t
+	destExisted := false
+
+	if fi, err := os.Lstat(dest); err == nil {
+		if !fi.Mode().IsRegular() {
+			logboek.Context(ctx).Debug().LogF("Removing non-regular path %q.\n", dest)
+			if err := os.RemoveAll(dest); err != nil {
+				return fmt.Errorf("error removing path %q: %w", dest, err)
+			}
+		} else {
+			destExisted = true
+			existingPerm = fi.Mode().Perm()
+			existingStat, _ = fi.Sys().(*syscall.Stat_t)
 		}
 	}
 
-	logboek.Context(ctx).Debug().LogF("Creating destination file %q.\n", dest)
-	destFile, err := os.Create(dest)
+	perm := srcFileInfo.Mode().Perm()
+
+	logboek.Context(ctx).Debug().LogF("Creating destination file %q with perms %s.\n", dest, perm)
+	destFile, err := os.OpenFile(dest, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return fmt.Errorf("error creating file %q: %w", dest, err)
 	}
 	defer destFile.Close()
 
-	logboek.Context(ctx).Debug().LogF("Chmod destination file %q to %s.\n", dest, srcFileInfo.Mode().Perm())
-	if err := destFile.Chmod(srcFileInfo.Mode().Perm()); err != nil {
-		return fmt.Errorf("error changing permissions for file %q to %s: %w", dest, srcFileInfo.Mode().Perm(), err)
+	needChmod := false
+	if destExisted {
+		needChmod = existingPerm != perm
+	} else {
+		needChmod = perm&c.processUmask != 0
+	}
+	if needChmod {
+		logboek.Context(ctx).Debug().LogF("Chmod destination file %q to %s.\n", dest, perm)
+		if err := destFile.Chmod(perm); err != nil {
+			return fmt.Errorf("error changing permissions for file %q to %s: %w", dest, perm, err)
+		}
 	}
 
-	if err := c.processFileOwnership(ctx, srcStat, destFile); err != nil {
+	if err := c.processFileOwnership(ctx, srcStat, destFile, existingStat); err != nil {
 		return fmt.Errorf("error processing file ownership: %w", err)
 	}
 
@@ -456,30 +630,52 @@ func (c *CopyRecurse) copySymlink(ctx context.Context, src string, dest string) 
 	return nil
 }
 
-func (c *CopyRecurse) processFileOwnership(ctx context.Context, srcStat *syscall.Stat_t, destFile *os.File) error {
+func (c *CopyRecurse) processFileOwnership(ctx context.Context, srcStat *syscall.Stat_t, destFile *os.File, existingStat *syscall.Stat_t) error {
 	logboek.Context(ctx).Debug().LogF("Processing file %q ownership.\n", destFile.Name())
 
-	uid, gid := getNewUIDAndGID(c.uid, c.gid, srcStat)
+	targetUID, targetGID := getNewUIDAndGID(c.uid, c.gid, srcStat)
+	currentUID, currentGID := currentOwnership(existingStat, c.processUID, c.processGID)
 
-	logboek.Context(ctx).Debug().LogF("Changing file %q ownership to %d/%d.\n", destFile.Name(), uid, gid)
-	if err := destFile.Chown(uid, gid); err != nil {
+	if targetUID == currentUID && targetGID == currentGID {
+		return nil
+	}
+
+	logboek.Context(ctx).Debug().LogF("Changing file %q ownership to %d/%d.\n", destFile.Name(), targetUID, targetGID)
+	if err := destFile.Chown(targetUID, targetGID); err != nil {
 		return fmt.Errorf("error changing ownership for %q: %w", destFile.Name(), err)
 	}
 
 	return nil
 }
 
-func (c *CopyRecurse) processDirOwnership(ctx context.Context, path string, srcStat *syscall.Stat_t) error {
+func (c *CopyRecurse) processDirOwnership(ctx context.Context, path string, srcStat, existingStat *syscall.Stat_t, freshlyCreated bool) error {
 	logboek.Context(ctx).Debug().LogF("Processing dir %q ownership.\n", path)
 
-	uid, gid := getNewUIDAndGID(c.uid, c.gid, srcStat)
+	targetUID, targetGID := getNewUIDAndGID(c.uid, c.gid, srcStat)
+	var currentUID, currentGID int
+	if freshlyCreated {
+		currentUID, currentGID = c.processUID, c.processGID
+	} else {
+		currentUID, currentGID = currentOwnership(existingStat, c.processUID, c.processGID)
+	}
 
-	logboek.Context(ctx).Debug().LogF("Changing dir %q ownership to %d/%d.\n", path, uid, gid)
-	if err := os.Lchown(path, uid, gid); err != nil {
+	if targetUID == currentUID && targetGID == currentGID {
+		return nil
+	}
+
+	logboek.Context(ctx).Debug().LogF("Changing dir %q ownership to %d/%d.\n", path, targetUID, targetGID)
+	if err := os.Lchown(path, targetUID, targetGID); err != nil {
 		return fmt.Errorf("error changing ownership for %q: %w", path, err)
 	}
 
 	return nil
+}
+
+func currentOwnership(st *syscall.Stat_t, fallbackUID, fallbackGID int) (int, int) {
+	if st == nil {
+		return fallbackUID, fallbackGID
+	}
+	return int(st.Uid), int(st.Gid)
 }
 
 func walkPath(ctx context.Context, path string, fn func(entryRelPath string, dirEntry *fs.DirEntry, err error) error) error {

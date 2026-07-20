@@ -322,7 +322,7 @@ func (c *CopyRecurse) processDir(ctx context.Context, src, dest string) error {
 		if err := c.copyRecurse(ctx, src, dest); err != nil {
 			return fmt.Errorf("error copying directory: %w", err)
 		}
-		return nil
+		return fs.SkipDir
 	case DirFallThrough:
 		logboek.Context(ctx).Debug().LogF("Will look for matches in directory %q.\n", src)
 		return nil

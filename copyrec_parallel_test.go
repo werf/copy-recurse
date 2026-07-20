@@ -168,6 +168,62 @@ func TestFastPathsOverwriteExistingFiles(t *testing.T) {
 	}
 }
 
+func TestDirMatchDoesNotDoubleProcess(t *testing.T) {
+	for _, parallelism := range []int{0, 4, 8} {
+		parallelism := parallelism
+		t.Run(fmt.Sprintf("parallelism=%d", parallelism), func(t *testing.T) {
+			root := t.TempDir()
+			src := filepath.Join(root, "src")
+			dest := filepath.Join(root, "dest")
+			if err := os.Mkdir(src, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.MkdirAll(filepath.Join(src, "lib"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "lib", "a"), []byte("a"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("/etc/ssl/certs", filepath.Join(src, "lib", "ssl-certs")); err != nil {
+				t.Fatal(err)
+			}
+
+			cr, err := copyrec.New(src, dest, copyrec.Options{
+				Parallelism: parallelism,
+				MatchDir: func(string) (copyrec.DirAction, error) {
+					return copyrec.DirMatch, nil
+				},
+				MatchFile: func(string) (bool, error) {
+					return true, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cr.Run(testCtx()); err != nil {
+				t.Fatalf("parallelism=%d: %v", parallelism, err)
+			}
+
+			if got, err := os.ReadFile(filepath.Join(dest, "lib", "a")); err != nil {
+				t.Fatal(err)
+			} else if string(got) != "a" {
+				t.Errorf("lib/a: content %q, want %q", got, "a")
+			}
+			fi, err := os.Lstat(filepath.Join(dest, "lib", "ssl-certs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode()&os.ModeSymlink == 0 {
+				t.Errorf("lib/ssl-certs: not a symlink")
+			}
+		})
+	}
+}
+
 func TestParallelPropagatesError(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "src")
